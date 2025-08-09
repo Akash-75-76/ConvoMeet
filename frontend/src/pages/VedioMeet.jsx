@@ -124,7 +124,7 @@ export default function VideoMeetComponent({ meetingId }) {
           try {
             await pc.addIceCandidate(new RTCIceCandidate(data.ice));
           } catch (err) {
-            console.warn("Failed to add ICE candidate", err);
+            console.warn("Failed to add ICE candidates", err);
           }
         }
       } catch (err) {
