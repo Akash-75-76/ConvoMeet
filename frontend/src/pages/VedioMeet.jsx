@@ -408,82 +408,52 @@ const VideoMeetComponent = () => {
     }
   }, []);
 
-  const handleUserJoined = useCallback(
-    (id, clients) => {
-      clients.forEach((socketListId) => {
-        if (connectionsRef.current[socketListId]) return;
+  const handleUserJoined = useCallback((id, clients) => {
+  clients.forEach((socketListId) => {
+    if (connectionsRef.current[socketListId]) return;
 
-        const pc = new RTCPeerConnection(peerConfigConnections);
-        connectionsRef.current[socketListId] = pc;
+    const pc = new RTCPeerConnection(peerConfigConnections);
+    connectionsRef.current[socketListId] = pc;
 
-        pc.onicecandidate = (event) => {
-          if (event.candidate) {
-            socketRef.current?.emit(
-              "signal",
-              socketListId,
-              JSON.stringify({ ice: event.candidate })
-            );
-          }
-        };
-
-        pc.ontrack = (event) => {
-          setRemoteStreams((prev) => {
-            const existing = prev.find(
-              (stream) => stream.socketId === socketListId
-            );
-            if (existing) {
-              return prev.map((stream) =>
-                stream.socketId === socketListId
-                  ? { ...stream, stream: event.streams[0] }
-                  : stream
-              );
-            }
-            return [
-              ...prev,
-              { socketId: socketListId, stream: event.streams[0] },
-            ];
-          });
-        };
-
-        // Add the local video stream
-        if (window.localStream) {
-          window.localStream.getTracks().forEach((track) => {
-            pc.addTrack(track, window.localStream);
-          });
-        } else {
-          const blackSilenceStream = getBlackSilenceStream();
-          blackSilenceStream.getTracks().forEach((track) => {
-            pc.addTrack(track, blackSilenceStream);
-          });
-        }
-      });
-
-      if (id === socketIdRef.current) {
-        Object.entries(connectionsRef.current).forEach(([id2, pc]) => {
-          if (id2 === socketIdRef.current) return;
-
-          pc.createOffer()
-            .then((description) => {
-              pc.setLocalDescription(description)
-                .then(() => {
-                  socketRef.current?.emit(
-                    "signal",
-                    id2,
-                    JSON.stringify({ sdp: pc.localDescription })
-                  );
-                })
-                .catch((error) => {
-                  console.error("Error setting local description:", error);
-                });
-            })
-            .catch((error) => {
-              console.error("Error creating offer:", error);
-            });
-        });
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        socketRef.current?.emit(
+          "signal",
+          socketListId,
+          JSON.stringify({ ice: event.candidate })
+        );
       }
-    },
-    [getBlackSilenceStream]
-  );
+    };
+
+    pc.ontrack = (event) => {
+      if (event.streams && event.streams[0]) {
+        setRemoteStreams((prev) => [
+          ...prev.filter(s => s.socketId !== socketListId),
+          { socketId: socketListId, stream: event.streams[0] }
+        ]);
+      }
+    };
+
+    // Add local stream
+    const streamToAdd = window.localStream || getBlackSilenceStream();
+    streamToAdd.getTracks().forEach(track => {
+      pc.addTrack(track, streamToAdd);
+    });
+
+    if (id === socketIdRef.current) {
+      pc.createOffer()
+        .then(offer => pc.setLocalDescription(offer))
+        .then(() => {
+          socketRef.current.emit(
+            "signal",
+            socketListId,
+            JSON.stringify({ sdp: pc.localDescription })
+          );
+        })
+        .catch(console.error);
+    }
+  });
+}, [getBlackSilenceStream]);
 
   const handleUserLeft = useCallback((id) => {
     if (connectionsRef.current[id]) {
