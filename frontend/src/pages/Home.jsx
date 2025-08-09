@@ -5,6 +5,10 @@ import "../home.css";
 import { Button, IconButton, TextField } from '@mui/material';
 import RestoreIcon from '@mui/icons-material/Restore';
 import { AuthContext } from '../contexts/AuthContext';
+import logo3 from '../assets/logo3.png'; // adjust path based on component location
+
+
+
 
 function Home() {
 
@@ -65,7 +69,9 @@ function Home() {
                     </div>
                 </div>
                 <div className='rightPanel'>
-                    <img srcSet='/logo3.png' alt="" />
+                   <img src={logo3} alt="" />
+
+
                 </div>
             </div>
         </>
