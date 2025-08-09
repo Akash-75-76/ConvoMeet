@@ -1,4 +1,3 @@
-// VideoMeetComponent.jsx
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import io from "socket.io-client";
 import {
@@ -8,302 +7,668 @@ import {
   CircularProgress,
   Snackbar,
   Alert,
-  Button,
 } from "@mui/material";
+import { Button } from "@mui/material";
 import VideocamIcon from "@mui/icons-material/Videocam";
 import VideocamOffIcon from "@mui/icons-material/VideocamOff";
+import styles from '/src/styles/vedioComponent.module.css';
+import CallEndIcon from "@mui/icons-material/CallEnd";
 import MicIcon from "@mui/icons-material/Mic";
 import MicOffIcon from "@mui/icons-material/MicOff";
 import ScreenShareIcon from "@mui/icons-material/ScreenShare";
 import StopScreenShareIcon from "@mui/icons-material/StopScreenShare";
 import ChatIcon from "@mui/icons-material/Chat";
-import CallEndIcon from "@mui/icons-material/CallEnd";
-import styles from "/src/styles/vedioComponent.module.css";
-import server from "../envirment"; // your environment.js
+import server from '../envirment';
 
-const ICE_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+const server_url =server;
 
-export default function VideoMeetComponent({ meetingId }) {
-  const localVideoRef = useRef(null);
+
+const peerConfigConnections = {
+  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+};
+
+const VideoMeetComponent = () => {
+  // Refs
   const socketRef = useRef(null);
   const socketIdRef = useRef(null);
-  const pcsRef = useRef({}); // { remoteSocketId: RTCPeerConnection }
-  const [remoteStreams, setRemoteStreams] = useState([]); // { socketId, stream }
-  const [localStream, setLocalStream] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const localVideoref = useRef(null);
+  const connectionsRef = useRef({});
+  const videoRefs = useRef({});
+
+  // State
+  const [mediaState, setMediaState] = useState({
+    videoAvailable: false,
+    audioAvailable: false,
+    screenAvailable: false,
+    videoEnabled: false,
+    audioEnabled: false,
+    screenEnabled: false,
+    loading: true,
+    error: null,
+  });
+
   const [uiState, setUiState] = useState({
-    askForUsername: true,
-    username: "",
     showChat: false,
     newMessages: 0,
+    askForUsername: true,
+    username: "",
   });
+
   const [messages, setMessages] = useState([]);
   const [messageInput, setMessageInput] = useState("");
+  const [remoteStreams, setRemoteStreams] = useState([]);
   const [snackbar, setSnackbar] = useState({
     open: false,
     message: "",
     severity: "info",
   });
 
-  // helper: attach remote stream or update existing
-  const upsertRemoteStream = useCallback((socketId, stream) => {
-    setRemoteStreams((prev) => {
-      const existing = prev.find((p) => p.socketId === socketId);
-      if (existing) {
-        return prev.map((p) =>
-          p.socketId === socketId ? { socketId, stream } : p
-        );
-      }
-      return [...prev, { socketId, stream }];
-    });
+  // Media stream utilities
+  const silence = useCallback(() => {
+    const ctx = new AudioContext();
+    const oscillator = ctx.createOscillator();
+    const dst = oscillator.connect(ctx.createMediaStreamDestination());
+    oscillator.start();
+    ctx.resume();
+    return Object.assign(dst.stream.getAudioTracks()[0], { enabled: false });
   }, []);
 
-  // create and return a RTCPeerConnection for a given remote socket id
-  const createPeerConnection = useCallback(
-    (remoteId) => {
-      if (pcsRef.current[remoteId]) return pcsRef.current[remoteId];
+  const black = useCallback(({ width = 640, height = 480 } = {}) => {
+    const canvas = Object.assign(document.createElement("canvas"), {
+      width,
+      height,
+    });
+    canvas.getContext("2d").fillRect(0, 0, width, height);
+    const stream = canvas.captureStream();
+    return Object.assign(stream.getVideoTracks()[0], { enabled: false });
+  }, []);
 
-      const pc = new RTCPeerConnection(ICE_CONFIG);
+  const getBlackSilenceStream = useCallback(() => {
+    return new MediaStream([black(), silence()]);
+  }, [black, silence]);
 
-      // send ICE candidates to remote
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          socketRef.current?.emit(
-            "signal",
-            remoteId,
-            JSON.stringify({ ice: event.candidate })
-          );
-        }
-      };
+  // Cleanup functions
+  const cleanupMediaStream = useCallback((stream) => {
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+    }
+  }, []);
 
-      // when remote track arrives
-      pc.ontrack = (event) => {
-        const stream = event.streams && event.streams[0];
-        if (stream) upsertRemoteStream(remoteId, stream);
-      };
-
-      pcsRef.current[remoteId] = pc;
-      return pc;
-    },
-    [upsertRemoteStream]
-  );
-
-  // handle incoming signals (sdp or ice)
-  const handleSignal = useCallback(
-    async (fromId, message) => {
-      try {
-        const data = JSON.parse(message);
-        const pc = createPeerConnection(fromId);
-
-        if (data.sdp) {
-          const remoteDesc = new RTCSessionDescription(data.sdp);
-          await pc.setRemoteDescription(remoteDesc);
-
-          if (data.sdp.type === "offer") {
-            // add local tracks if not added
-            if (localStream) {
-              localStream.getTracks().forEach((t) => {
-                // avoid duplicate senders
-                try {
-                  pc.addTrack(t, localStream);
-                } catch (e) {console.log(e)}
-              });
-            }
-
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            socketRef.current?.emit(
-              "signal",
-              fromId,
-              JSON.stringify({ sdp: pc.localDescription })
-            );
-          }
-        }
-
-        if (data.ice) {
-          try {
-            await pc.addIceCandidate(new RTCIceCandidate(data.ice));
-          } catch (err) {
-            console.warn("Failed to add ICE candidates", err);
-          }
-        }
-      } catch (err) {
-        console.error("handleSignal error", err);
+  const cleanupConnections = useCallback(() => {
+    Object.values(connectionsRef.current).forEach((pc) => {
+      if (pc) {
+        pc.close();
       }
-    },
-    [createPeerConnection, localStream]
-  );
+    });
+    connectionsRef.current = {};
+  }, []);
 
-  // called when an existing user is in room -> we will create offer to them
-  const handleNewPeer = useCallback(
-    async (newPeerId) => {
-      // existing peer should initiate offer to the new peer
-      const pc = createPeerConnection(newPeerId);
+  // Media handling
+  const getUserMediaSuccess = useCallback(
+    (stream) => {
+      try {
+        if (localVideoref.current?.srcObject) {
+          cleanupMediaStream(localVideoref.current.srcObject);
+        }
 
-      // add local stream tracks
-      if (localStream) {
-        localStream.getTracks().forEach((track) => {
+        localVideoref.current.srcObject = stream;
+        window.localStream = stream;
+
+        // Update all existing connections with the new stream
+        Object.entries(connectionsRef.current).forEach(([id, pc]) => {
+          if (id === socketIdRef.current) return;
+
           try {
-            pc.addTrack(track, localStream);
-          } catch (e) {console.log(e)}
+            pc.getSenders().forEach((sender) => pc.removeTrack(sender));
+            stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+            pc.createOffer()
+              .then((description) => {
+                pc.setLocalDescription(description)
+                  .then(() => {
+                    socketRef.current?.emit(
+                      "signal",
+                      id,
+                      JSON.stringify({ sdp: pc.localDescription })
+                    );
+                  })
+                  .catch((error) => {
+                    console.error("Error setting local description:", error);
+                    setSnackbar({
+                      open: true,
+                      message: "Error updating stream",
+                      severity: "error",
+                    });
+                  });
+              })
+              .catch((error) => {
+                console.error("Error creating offer:", error);
+                setSnackbar({
+                  open: true,
+                  message: "Error creating offer",
+                  severity: "error",
+                });
+              });
+          } catch (error) {
+            console.error("Error updating peer connection:", error);
+          }
+        });
+
+        // Handle track ended events
+        stream.getTracks().forEach((track) => {
+          track.onended = () => {
+            setMediaState((prev) => ({
+              ...prev,
+              videoEnabled: false,
+              audioEnabled: false,
+            }));
+            handleMediaChange(false, false);
+          };
+        });
+      } catch (error) {
+        console.error("Error handling user media:", error);
+        setSnackbar({
+          open: true,
+          message: "Error accessing media devices",
+          severity: "error",
         });
       }
-
-      try {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        socketRef.current?.emit(
-          "signal",
-          newPeerId,
-          JSON.stringify({ sdp: pc.localDescription })
-        );
-      } catch (err) {
-        console.error("Error creating/sending offer", err);
-      }
     },
-    [createPeerConnection, localStream]
+    [cleanupMediaStream]
   );
 
-  // when joining, server sends existing peers array — we create peer connections for them (but DO NOT create offers)
-  const handleExistingPeers = useCallback(
-    (peers) => {
-      if (!Array.isArray(peers)) return;
-      peers.forEach((peerId) => {
-        // establish pc and wait for them to send offer (they will if they are existing -> they already sent offers earlier)
-        createPeerConnection(peerId);
-      });
+  const getDisplayMediaSuccess = useCallback(
+    (stream) => {
+      try {
+        if (localVideoref.current?.srcObject) {
+          cleanupMediaStream(localVideoref.current.srcObject);
+        }
+
+        localVideoref.current.srcObject = stream;
+        window.localStream = stream;
+
+        // Update all existing connections with the new stream
+        Object.entries(connectionsRef.current).forEach(([id, pc]) => {
+          if (id === socketIdRef.current) return;
+
+          try {
+            pc.getSenders().forEach((sender) => pc.removeTrack(sender));
+            stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+            pc.createOffer()
+              .then((description) => {
+                pc.setLocalDescription(description)
+                  .then(() => {
+                    socketRef.current?.emit(
+                      "signal",
+                      id,
+                      JSON.stringify({ sdp: pc.localDescription })
+                    );
+                  })
+                  .catch((error) => {
+                    console.error("Error setting local description:", error);
+                    setSnackbar({
+                      open: true,
+                      message: "Error updating screen share",
+                      severity: "error",
+                    });
+                  });
+              })
+              .catch((error) => {
+                console.error("Error creating offer:", error);
+                setSnackbar({
+                  open: true,
+                  message: "Error creating screen share offer",
+                  severity: "error",
+                });
+              });
+          } catch (error) {
+            console.error("Error updating peer connection:", error);
+          }
+        });
+
+        // Handle track ended events
+        stream.getTracks().forEach((track) => {
+          track.onended = () => {
+            setMediaState((prev) => ({
+              ...prev,
+              screenEnabled: false,
+            }));
+            handleScreenShare(false);
+          };
+        });
+      } catch (error) {
+        console.error("Error handling display media:", error);
+        setSnackbar({
+          open: true,
+          message: "Error sharing screen",
+          severity: "error",
+        });
+      }
     },
-    [createPeerConnection]
+    [cleanupMediaStream]
   );
 
-  // when remote user leaves
-  const handleUserLeft = useCallback((id) => {
-    const pc = pcsRef.current[id];
-    if (pc) {
+  const handleMediaChange = useCallback(
+    async (videoEnabled, audioEnabled) => {
       try {
-        pc.close();
-      } catch (e) {console.log(e)}
-      delete pcsRef.current[id];
-    }
-    setRemoteStreams((prev) => prev.filter((s) => s.socketId !== id));
-  }, []);
+        if (videoEnabled || audioEnabled) {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: videoEnabled && mediaState.videoAvailable,
+            audio: audioEnabled && mediaState.audioAvailable,
+          });
+          getUserMediaSuccess(stream);
+        } else {
+          const blackSilenceStream = getBlackSilenceStream();
+          localVideoref.current.srcObject = blackSilenceStream;
+          window.localStream = blackSilenceStream;
 
-  // connect to socket and set handlers
-  const connectSocket = useCallback(() => {
-    socketRef.current = io(server, { transports: ["websocket"] });
+          // Update all connections with the black silence stream
+          Object.entries(connectionsRef.current).forEach(([id, pc]) => {
+            if (id === socketIdRef.current) return;
 
-    socketRef.current.on("connect", () => {
-      socketIdRef.current = socketRef.current.id;
-      // join the room (use meetingId or window.location.href)
-      const path = meetingId || window.location.href;
-      socketRef.current.emit("join-call", path);
-    });
+            try {
+              pc.getSenders().forEach((sender) => pc.removeTrack(sender));
+              blackSilenceStream
+                .getTracks()
+                .forEach((track) => pc.addTrack(track, blackSilenceStream));
 
-    socketRef.current.on("existing-peers", handleExistingPeers);
-    socketRef.current.on("new-peer", handleNewPeer);
-    socketRef.current.on("signal", handleSignal);
-    socketRef.current.on("user-left", handleUserLeft);
-
-    socketRef.current.on("chat-message", (data, sender, socketIdSender) => {
-      setMessages((prev) => [...prev, { sender, data }]);
-      if (socketIdSender !== socketIdRef.current) {
-        setUiState((prev) => ({ ...prev, newMessages: prev.newMessages + 1 }));
+              pc.createOffer()
+                .then((description) => {
+                  pc.setLocalDescription(description)
+                    .then(() => {
+                      socketRef.current?.emit(
+                        "signal",
+                        id,
+                        JSON.stringify({ sdp: pc.localDescription })
+                      );
+                    })
+                    .catch((error) => {
+                      console.error("Error setting local description:", error);
+                      setSnackbar({
+                        open: true,
+                        message: "Error updating stream",
+                        severity: "error",
+                      });
+                    });
+                })
+                .catch((error) => {
+                  console.error("Error creating offer:", error);
+                  setSnackbar({
+                    open: true,
+                    message: "Error creating offer",
+                    severity: "error",
+                  });
+                });
+            } catch (error) {
+              console.error("Error updating peer connection:", error);
+            }
+          });
+        }
+      } catch (error) {
+        console.error("Error changing media state:", error);
+        setSnackbar({
+          open: true,
+          message: `Error ${videoEnabled ? "enabling" : "disabling"} ${
+            audioEnabled ? "audio/video" : "video"
+          }`,
+          severity: "error",
+        });
       }
-    });
+    },
+    [
+      getUserMediaSuccess,
+      getBlackSilenceStream,
+      mediaState.videoAvailable,
+      mediaState.audioAvailable,
+    ]
+  );
 
-    socketRef.current.on("connect_error", (err) => {
-      console.error("Socket connect error", err);
-      setSnackbar({
-        open: true,
-        message: "Socket connection error",
-        severity: "error",
-      });
-    });
-  }, [
-    meetingId,
-    handleExistingPeers,
-    handleNewPeer,
-    handleSignal,
-    handleUserLeft,
-  ]);
+  const handleScreenShare = useCallback(
+    async (screenEnabled) => {
+      try {
+        if (screenEnabled) {
+          const stream = await navigator.mediaDevices.getDisplayMedia({
+            video: true,
+            audio: true,
+          });
+          getDisplayMediaSuccess(stream);
+        } else {
+          // Return to previous media state
+          handleMediaChange(mediaState.videoEnabled, mediaState.audioEnabled);
+        }
+      } catch (error) {
+        console.error("Error handling screen share:", error);
+        if (error.name !== "NotAllowedError") {
+          setSnackbar({
+            open: true,
+            message: "Error sharing screen",
+            severity: "error",
+          });
+        }
+        setMediaState((prev) => ({ ...prev, screenEnabled: false }));
+      }
+    },
+    [
+      getDisplayMediaSuccess,
+      handleMediaChange,
+      mediaState.videoEnabled,
+      mediaState.audioEnabled,
+    ]
+  );
 
-  // get local media
-  const startLocalMedia = useCallback(async (video = true, audio = true) => {
+  // Socket and WebRTC handling
+  const handleSignal = useCallback((fromId, message) => {
     try {
-      const s = await navigator.mediaDevices.getUserMedia({ video, audio });
-      setLocalStream(s);
-      if (localVideoRef.current) localVideoRef.current.srcObject = s;
-      setLoading(false);
-      return s;
-    } catch (err) {
-      console.error("getUserMedia failed", err);
-      setSnackbar({
-        open: true,
-        message: "Microphone/Camera access denied",
-        severity: "error",
-      });
-      setLoading(false);
-      throw err;
+      const signal = JSON.parse(message);
+
+      if (fromId !== socketIdRef.current) {
+        const pc = connectionsRef.current[fromId];
+        if (!pc) return;
+
+        if (signal.sdp) {
+          pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
+            .then(() => {
+              if (signal.sdp.type === "offer") {
+                pc.createAnswer()
+                  .then((description) => {
+                    pc.setLocalDescription(description)
+                      .then(() => {
+                        socketRef.current?.emit(
+                          "signal",
+                          fromId,
+                          JSON.stringify({ sdp: pc.localDescription })
+                        );
+                      })
+                      .catch((error) => {
+                        console.error(
+                          "Error setting local description:",
+                          error
+                        );
+                      });
+                  })
+                  .catch((error) => {
+                    console.error("Error creating answer:", error);
+                  });
+              }
+            })
+            .catch((error) => {
+              console.error("Error setting remote description:", error);
+            });
+        }
+
+        if (signal.ice) {
+          pc.addIceCandidate(new RTCIceCandidate(signal.ice)).catch((error) => {
+            console.error("Error adding ICE candidate:", error);
+          });
+        }
+      }
+    } catch (error) {
+      console.error("Error handling signal:", error);
     }
   }, []);
 
-  // start call: get media and connect socket
-  const startCall = useCallback(async () => {
+  const handleUserJoined = useCallback(
+    (id, clients) => {
+      clients.forEach((socketListId) => {
+        if (connectionsRef.current[socketListId]) return;
+
+        const pc = new RTCPeerConnection(peerConfigConnections);
+        connectionsRef.current[socketListId] = pc;
+
+        pc.onicecandidate = (event) => {
+          if (event.candidate) {
+            socketRef.current?.emit(
+              "signal",
+              socketListId,
+              JSON.stringify({ ice: event.candidate })
+            );
+          }
+        };
+
+        pc.ontrack = (event) => {
+          setRemoteStreams((prev) => {
+            const existing = prev.find(
+              (stream) => stream.socketId === socketListId
+            );
+            if (existing) {
+              return prev.map((stream) =>
+                stream.socketId === socketListId
+                  ? { ...stream, stream: event.streams[0] }
+                  : stream
+              );
+            }
+            return [
+              ...prev,
+              { socketId: socketListId, stream: event.streams[0] },
+            ];
+          });
+        };
+
+        // Add the local video stream
+        if (window.localStream) {
+          window.localStream.getTracks().forEach((track) => {
+            pc.addTrack(track, window.localStream);
+          });
+        } else {
+          const blackSilenceStream = getBlackSilenceStream();
+          blackSilenceStream.getTracks().forEach((track) => {
+            pc.addTrack(track, blackSilenceStream);
+          });
+        }
+      });
+
+      if (id === socketIdRef.current) {
+        Object.entries(connectionsRef.current).forEach(([id2, pc]) => {
+          if (id2 === socketIdRef.current) return;
+
+          pc.createOffer()
+            .then((description) => {
+              pc.setLocalDescription(description)
+                .then(() => {
+                  socketRef.current?.emit(
+                    "signal",
+                    id2,
+                    JSON.stringify({ sdp: pc.localDescription })
+                  );
+                })
+                .catch((error) => {
+                  console.error("Error setting local description:", error);
+                });
+            })
+            .catch((error) => {
+              console.error("Error creating offer:", error);
+            });
+        });
+      }
+    },
+    [getBlackSilenceStream]
+  );
+
+  const handleUserLeft = useCallback((id) => {
+    if (connectionsRef.current[id]) {
+      connectionsRef.current[id].close();
+      delete connectionsRef.current[id];
+    }
+
+    setRemoteStreams((prev) => prev.filter((stream) => stream.socketId !== id));
+  }, []);
+
+  const addChatMessage = useCallback((data, sender, socketIdSender) => {
+    setMessages((prev) => [...prev, { sender, data }]);
+    if (socketIdSender !== socketIdRef.current) {
+      setUiState((prev) => ({ ...prev, newMessages: prev.newMessages + 1 }));
+    }
+  }, []);
+
+  // Initialization and cleanup
+  useEffect(() => {
+    const checkPermissions = async () => {
+      try {
+        setMediaState((prev) => ({ ...prev, loading: true }));
+
+        const [videoPermission, audioPermission] = await Promise.all([
+          navigator.mediaDevices
+            .getUserMedia({ video: true })
+            .then(() => true)
+            .catch(() => false),
+          navigator.mediaDevices
+            .getUserMedia({ audio: true })
+            .then(() => true)
+            .catch(() => false),
+        ]);
+
+        const screenAvailable = !!navigator.mediaDevices.getDisplayMedia;
+
+        setMediaState({
+          videoAvailable: videoPermission,
+          audioAvailable: audioPermission,
+          screenAvailable,
+          videoEnabled: false,
+          audioEnabled: false,
+          screenEnabled: false,
+          loading: false,
+          error: null,
+        });
+      } catch (error) {
+        console.error("Error checking permissions:", error);
+        setMediaState((prev) => ({
+          ...prev,
+          loading: false,
+          error: "Could not access media devices",
+        }));
+        setSnackbar({
+          open: true,
+          message: "Error accessing media devices",
+          severity: "error",
+        });
+      }
+    };
+
+    checkPermissions();
+
+    return () => {
+      cleanupConnections();
+      if (socketRef.current) {
+        socketRef.current.disconnect();
+      }
+      cleanupMediaStream(localVideoref.current?.srcObject);
+    };
+  }, [cleanupConnections, cleanupMediaStream]);
+
+  const connectToSocketServer = useCallback(() => {
+    try {
+      socketRef.current = io.connect(server_url, { secure: false });
+
+      socketRef.current.on("signal", handleSignal);
+      socketRef.current.on("user-joined", handleUserJoined);
+      socketRef.current.on("user-left", handleUserLeft);
+      socketRef.current.on("chat-message", addChatMessage);
+
+      socketRef.current.on("connect", () => {
+        socketRef.current.emit("join-call", window.location.href);
+        socketIdRef.current = socketRef.current.id;
+      });
+
+      socketRef.current.on("connect_error", (error) => {
+        console.error("Connection error:", error);
+        setSnackbar({
+          open: true,
+          message: "Connection error",
+          severity: "error",
+        });
+      });
+    } catch (error) {
+      console.error("Error connecting to socket server:", error);
+      setSnackbar({
+        open: true,
+        message: "Error connecting to server",
+        severity: "error",
+      });
+    }
+  }, [handleSignal, handleUserJoined, handleUserLeft, addChatMessage]);
+
+  const startCall = useCallback(() => {
     if (!uiState.username.trim()) {
       setSnackbar({
         open: true,
-        message: "Enter username",
+        message: "Please enter a username",
         severity: "warning",
       });
       return;
     }
-    setUiState((prev) => ({ ...prev, askForUsername: false }));
-    await startLocalMedia(true, true);
-    connectSocket();
-  }, [uiState.username, startLocalMedia, connectSocket]);
 
-  useEffect(() => {
-    // cleanup on unmount
-    return () => {
-      Object.values(pcsRef.current).forEach((pc) => {
-        try {
-          pc.close();
-        } catch (e) {console.log(e)}
-      });
-      pcsRef.current = {};
-      if (socketRef.current) socketRef.current.disconnect();
-      if (localStream) {
-        localStream.getTracks().forEach((t) => t.stop());
-      }
-    };
-  }, [localStream]);
+    setUiState((prev) => ({ ...prev, askForUsername: false }));
+    connectToSocketServer();
+    handleMediaChange(mediaState.videoAvailable, mediaState.audioAvailable);
+  }, [
+    uiState.username,
+    connectToSocketServer,
+    handleMediaChange,
+    mediaState.videoAvailable,
+    mediaState.audioAvailable,
+  ]);
+
+  const endCall = useCallback(() => {
+    cleanupConnections();
+    cleanupMediaStream(localVideoref.current?.srcObject);
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+    }
+    window.location.href = "/";
+  }, [cleanupConnections, cleanupMediaStream]);
 
   const sendMessage = useCallback(() => {
     if (!messageInput.trim()) return;
+
     socketRef.current?.emit("chat-message", messageInput, uiState.username);
     setMessageInput("");
   }, [messageInput, uiState.username]);
 
-  const endCall = useCallback(() => {
-    Object.values(pcsRef.current).forEach((pc) => {
-      try {
-        pc.close();
-      } catch (e) {console.log(e)}
-    });
-    pcsRef.current = {};
-    if (socketRef.current) socketRef.current.disconnect();
-    if (localStream) {
-      localStream.getTracks().forEach((t) => t.stop());
-    }
-    window.location.href = "/"; // or navigate elsewhere
-  }, [localStream]);
+  // UI handlers
+  const toggleVideo = useCallback(() => {
+    const newVideoState = !mediaState.videoEnabled;
+    setMediaState((prev) => ({ ...prev, videoEnabled: newVideoState }));
+    handleMediaChange(newVideoState, mediaState.audioEnabled);
+  }, [mediaState.videoEnabled, mediaState.audioEnabled, handleMediaChange]);
 
-  // UI render handling
-  if (loading) {
+  const toggleAudio = useCallback(() => {
+    const newAudioState = !mediaState.audioEnabled;
+    setMediaState((prev) => ({ ...prev, audioEnabled: newAudioState }));
+    handleMediaChange(mediaState.videoEnabled, newAudioState);
+  }, [mediaState.audioEnabled, mediaState.videoEnabled, handleMediaChange]);
+
+  const toggleScreenShare = useCallback(() => {
+    const newScreenState = !mediaState.screenEnabled;
+    setMediaState((prev) => ({ ...prev, screenEnabled: newScreenState }));
+    handleScreenShare(newScreenState);
+  }, [mediaState.screenEnabled, handleScreenShare]);
+
+  const toggleChat = useCallback(() => {
+    setUiState((prev) => ({
+      ...prev,
+      showChat: !prev.showChat,
+      newMessages: prev.showChat ? prev.newMessages : 0,
+    }));
+  }, []);
+
+  if (mediaState.loading) {
     return (
       <div className={styles.loadingContainer}>
         <CircularProgress />
-        <p>Preparing...</p>
+        <p>Checking media permissions...</p>
+      </div>
+    );
+  }
+
+  if (mediaState.error) {
+    return (
+      <div className={styles.errorContainer}>
+        <Alert severity="error">{mediaState.error}</Alert>
+
+        <Button variant="contained" onClick={() => window.location.reload()}>
+          Retry
+        </Button>
       </div>
     );
   }
@@ -313,11 +678,13 @@ export default function VideoMeetComponent({ meetingId }) {
       <div className={styles.lobbyContainer}>
         <h2>Enter into Lobby</h2>
         <TextField
+          id="username-input"
           label="Username"
           value={uiState.username}
           onChange={(e) =>
             setUiState((prev) => ({ ...prev, username: e.target.value }))
           }
+          variant="outlined"
           fullWidth
           margin="normal"
         />
@@ -328,14 +695,15 @@ export default function VideoMeetComponent({ meetingId }) {
         >
           Connect
         </Button>
+
         <div className={styles.previewContainer}>
           <video
-            ref={localVideoRef}
+            ref={localVideoref}
             autoPlay
             muted
             playsInline
             className={styles.previewVideo}
-          />
+          ></video>
         </div>
       </div>
     );
@@ -343,106 +711,156 @@ export default function VideoMeetComponent({ meetingId }) {
 
   return (
     <div className={styles.meetContainer}>
+      {/* Snackbar for notifications */}
       <Snackbar
         open={snackbar.open}
-        autoHideDuration={5000}
+        autoHideDuration={6000}
         onClose={() => setSnackbar((prev) => ({ ...prev, open: false }))}
       >
-        <Alert severity={snackbar.severity}>{snackbar.message}</Alert>
+        <Alert
+          onClose={() => setSnackbar((prev) => ({ ...prev, open: false }))}
+          severity={snackbar.severity}
+        >
+          {snackbar.message}
+        </Alert>
       </Snackbar>
 
-      {/* video grid */}
+      {/* Chat modal */}
+      {uiState.showChat && (
+        <div className={styles.chatModal}>
+          <div className={styles.chatHeader}>
+            <h3>Chat</h3>
+            <Button onClick={toggleChat}>Close</Button>
+          </div>
+
+          <div className={styles.chatMessages}>
+            {messages.length > 0 ? (
+              messages.map((msg, index) => (
+                <div key={index} className={styles.message}>
+                  <strong>{msg.sender}: </strong>
+                  <span>{msg.data}</span>
+                </div>
+              ))
+            ) : (
+              <p className={styles.noMessages}>No messages yet</p>
+            )}
+          </div>
+
+          <div className={styles.chatInput}>
+            <TextField
+              fullWidth
+              value={messageInput}
+              onChange={(e) => setMessageInput(e.target.value)}
+              placeholder="Type a message..."
+              onKeyPress={(e) => e.key === "Enter" && sendMessage()}
+            />
+            <Button
+              variant="contained"
+              onClick={sendMessage}
+              disabled={!messageInput.trim()}
+            >
+              Send
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Video containers */}
       <div className={styles.videoGrid}>
+        {/* Local video */}
         <div className={styles.videoContainer}>
           <video
-            ref={localVideoRef}
+            ref={localVideoref}
             autoPlay
             muted
             playsInline
             className={styles.videoElement}
           />
-          <div className={styles.videoLabel}>You ({uiState.username})</div>
+          <div className={styles.videoLabel}>
+            You ({uiState.username})
+            {!mediaState.videoEnabled && <span> (Camera off)</span>}
+          </div>
         </div>
 
+        {/* Remote videos */}
         {remoteStreams.map(({ socketId, stream }) => (
-          <RemoteVideo key={socketId} socketId={socketId} stream={stream} />
+          <div key={socketId} className={styles.videoContainer}>
+            <video
+              ref={(el) => {
+                if (el && stream) {
+                  el.srcObject = stream;
+                }
+                videoRefs.current[socketId] = el;
+              }}
+              autoPlay
+              playsInline
+              className={styles.videoElement}
+            />
+            <div className={styles.videoLabel}>
+              Participant {socketId.substring(0, 6)}
+            </div>
+          </div>
         ))}
       </div>
 
-      {/* controls (small subset) */}
+      {/* Controls */}
       <div className={styles.controls}>
         <IconButton
-          onClick={() => {
-            const enabled = localStream?.getVideoTracks()[0]?.enabled;
-            if (localStream) localStream.getVideoTracks()[0].enabled = !enabled;
-          }}
-        >
-          <VideocamIcon />
-        </IconButton>
-
-        <IconButton
-          onClick={() => {
-            const enabled = localStream?.getAudioTracks()[0]?.enabled;
-            if (localStream) localStream.getAudioTracks()[0].enabled = !enabled;
-          }}
-        >
-          <MicIcon />
-        </IconButton>
-
-        <IconButton
-          onClick={() =>
-            setUiState((prev) => ({ ...prev, showChat: !prev.showChat }))
+          onClick={toggleVideo}
+          color={mediaState.videoEnabled ? "primary" : "default"}
+          aria-label={
+            mediaState.videoEnabled ? "Turn off camera" : "Turn on camera"
           }
+        >
+          {mediaState.videoEnabled ? <VideocamIcon /> : <VideocamOffIcon />}
+        </IconButton>
+
+        <IconButton
+          onClick={toggleAudio}
+          color={mediaState.audioEnabled ? "primary" : "default"}
+          aria-label={
+            mediaState.audioEnabled ? "Mute microphone" : "Unmute microphone"
+          }
+        >
+          {mediaState.audioEnabled ? <MicIcon /> : <MicOffIcon />}
+        </IconButton>
+
+        {mediaState.screenAvailable && (
+          <IconButton
+            onClick={toggleScreenShare}
+            color={mediaState.screenEnabled ? "primary" : "default"}
+            aria-label={
+              mediaState.screenEnabled ? "Stop screen share" : "Share screen"
+            }
+          >
+            {mediaState.screenEnabled ? (
+              <StopScreenShareIcon />
+            ) : (
+              <ScreenShareIcon />
+            )}
+          </IconButton>
+        )}
+
+        <IconButton
+          onClick={toggleChat}
+          color={uiState.showChat ? "primary" : "default"}
+          aria-label="Toggle chat"
         >
           <Badge badgeContent={uiState.newMessages} color="error">
             <ChatIcon />
           </Badge>
         </IconButton>
 
-        <IconButton onClick={endCall} style={{ color: "red" }}>
+        <IconButton
+          onClick={endCall}
+          style={{ color: "red" }}
+          aria-label="End call"
+        >
           <CallEndIcon />
         </IconButton>
       </div>
-
-      {/* Chat */}
-      {uiState.showChat && (
-        <div className={styles.chatModal}>
-          <div className={styles.chatMessages}>
-            {messages.map((m, i) => (
-              <div key={i}>
-                <strong>{m.sender}: </strong>
-                {m.data}
-              </div>
-            ))}
-          </div>
-          <div className={styles.chatInput}>
-            <TextField
-              fullWidth
-              value={messageInput}
-              onChange={(e) => setMessageInput(e.target.value)}
-              onKeyPress={(e) => e.key === "Enter" && sendMessage()}
-            />
-            <Button onClick={sendMessage} variant="contained">
-              Send
-            </Button>
-          </div>
-        </div>
-      )}
     </div>
   );
-}
+};
 
-function RemoteVideo({ socketId, stream }) {
-  const ref = useRef();
-  useEffect(() => {
-    if (ref.current && stream) ref.current.srcObject = stream;
-  }, [stream]);
-  return (
-    <div className={styles.videoContainer}>
-      <video ref={ref} autoPlay playsInline className={styles.videoElement} />
-      <div className={styles.videoLabel}>
-        Participant {socketId.substring(0, 6)}
-      </div>
-    </div>
-  );
-}
+export default VideoMeetComponent;
